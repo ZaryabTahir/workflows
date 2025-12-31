@@ -1,0 +1,247 @@
+#      ####################################### FINALIZED ###############################################
+
+
+name: "Reusable Android Build Workflow"
+
+on:
+  workflow_call:
+    inputs:
+      # qa_repository:              # REPOSITORY   "${{ inputs.qa_repository }}"
+      #   required: true
+      #   type: string
+      gm_android_14:          # GM_ANDROID_14   "${{ inputs.gm_android_14 }}"
+        required: true
+        type: string
+      gmsaas_instance_name:   #  GMSAAS_INSTANCE_NAME    "${{ inputs.gmsaas_instance_name }}"
+        required: true
+        type: string
+      android_api_levels:     #  ANDROID_API_LEVELS      "${{ inputs.android_api_levels }}"  
+        required: true
+        type: string
+      android_home:           #  ANDROID_HOME    ${{ inputs.android_home }}
+        required: true
+        type: string
+      android_sdk_root:       # ANDROID_SDK_ROOT    "${{ inputs.android_sdk_root }}"
+        required: true
+        type: string
+      appium_home:            #  APPIUM_HOME    "${{ inputs.appium_home }}"
+        required: true
+        type: string
+      # signed_url:            # SIGNED_URL   "${{ inputs.signed_url }}"
+      #   required: true
+      #   type: string
+
+permissions:
+  contents: read
+
+jobs:
+  run_android_e2e:
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set environment variables
+        run: |
+          echo "GM_ANDROID_14=${{ inputs.gm_android_14 }}" >> $GITHUB_ENV
+          echo "GMSAAS_INSTANCE_NAME=${{ inputs.gmsaas_instance_name }}" >> $GITHUB_ENV
+          echo "ANDROID_API_LEVELS=${{ inputs.android_api_levels }}" >> $GITHUB_ENV
+         
+          echo "ANDROID_HOME=${{ inputs.android_home }}" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=${{ inputs.android_sdk_root }}" >> $GITHUB_ENV
+          echo "APPIUM_HOME=${{ inputs.appium_home }}" >> $GITHUB_ENV
+
+
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Extract Payload
+        run: |
+          echo "Triggered by repo: ${{ github.event.client_payload.repo }}"
+          echo "Branch: ${{ github.event.client_payload.branch }}"
+          echo "Commit: ${{ github.event.client_payload.commit }}"
+          echo "URL: ${{ github.event.client_payload.url }}"
+
+      - name: Download APK
+        run: |
+          echo "Downloading APK from Google Bucket"
+          mkdir -p app/android
+          curl -o app/android/app.apk "${{ github.event.client_payload.url }}"
+          echo "✅ APK downloaded successfully"
+          ls -la app/android
+        # curl -o app/android/app.apk "${{ inputs.signed_url }}"
+
+
+      - name: Verify APK file
+        run: |
+          echo "Checking APK file..."
+          file app/android/app.apk
+          ls -lh app/android/app.apk
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: 🏗️ Install Dependencies
+        run: |
+          npm ci
+          npm install
+
+      # - name: Debug Secret (first 50 chars only)
+      #   run: echo "${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}" | cut -c1-50
+          
+      - name: 🔧 Install OCR Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-eng
+
+      - name: 📱 Install Appium and UiAutomator2 Driver
+        run: |
+          npm install -g appium@latest
+          appium driver install uiautomator2
+          appium --version
+          echo "Appium installation completed"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          api-level: 30
+          target: default
+          arch: x86_64
+          build-tools-version: "34.0.0"
+            
+      - name: Accept Android SDK Licenses
+        run: yes | sdkmanager --licenses
+
+      - name: Install Build Tools & Platforms
+        run: |
+          sdkmanager "build-tools;34.0.0" "platform-tools"
+          for level in $ANDROID_API_LEVELS; do
+            sdkmanager "platforms;android-$level"
+          done
+
+      - name: Debug apksigner path (optional)
+        run: find $ANDROID_HOME -name apksigner.jar
+        # run: find ${{ inputs.android_home }} -name apksigner.jar
+
+      - name: Install Genymotion CLI
+        run: |
+          pip3 install gmsaas
+          gmsaas config set android-sdk-path "$ANDROID_HOME"
+
+      - name: Authenticate Genymotion
+        run: gmsaas auth login ${{ secrets.GENYMOTION_EMAIL }} ${{ secrets.GENYMOTION_PW }}
+
+      - name: 
+        id: start_instance
+        run: |
+          INSTANCE_UUID=$(gmsaas instances start "${{ env.GM_ANDROID_14 }}" "${{ env.GMSAAS_INSTANCE_NAME }}")
+          echo "instance_uuid=$INSTANCE_UUID" >> "$GITHUB_OUTPUT"
+          echo "Waiting 20 seconds for instance to boot..."
+          sleep 20
+
+      - name: Connect Instance to ADB
+        run: |
+          gmsaas instances adbconnect "${{ steps.start_instance.outputs.instance_uuid }}"
+          $ANDROID_HOME/platform-tools/adb devices
+          echo "Connected devices:"
+          $ANDROID_HOME/platform-tools/adb devices -l
+
+      - name: Wait for Emulator to be Online
+        run: |
+          echo "Waiting for Genymotion emulator to be online..."
+          for i in {1..30}; do
+            STATUS=$($ANDROID_HOME/platform-tools/adb devices | grep localhost | awk '{print $2}')
+            if [ "$STATUS" = "device" ]; then
+              echo "Emulator is online!"
+              break
+            fi
+            echo "Emulator status: $STATUS. Waiting 5 seconds..."
+            sleep 5
+          done
+          if [ "$STATUS" != "device" ]; then
+            echo "❌ Emulator did not come online in time."
+            exit 1
+          fi
+
+      - name: Install APK on Emulator
+        run: |
+          echo "Installing APK on Emulator..."
+          $ANDROID_HOME/platform-tools/adb install app/android/app.apk
+
+      - name: Start Appium Server
+        run: |
+          echo "🚀 Starting Appium server..."
+          appium --log-level error --relaxed-security &
+          echo "Waiting for Appium server to start..."
+          sleep 10
+          echo "Checking if Appium server is running..."
+          curl -f http://127.0.0.1:4723/status || (echo "❌ Appium server failed to start" && exit 1)
+          echo "✅ Appium server is running"
+
+      - name: Run Standard E2E Tests
+        id: run_standard_tests
+        continue-on-error: true
+        run: |
+          echo "🚀 Running WebDriverIO Standard Tests..."
+          npm run test:standard
+          STANDARD_STATUS=$?
+          echo "standard_status=$STANDARD_STATUS" >> "$GITHUB_OUTPUT"
+          exit $STANDARD_STATUS
+
+      - name: Generate Allure Report
+        if: always()
+        run: |
+          echo "📊 Generating Allure Report..."
+          npm run test:report
+          echo "Allure report generated successfully"
+
+      - name: Stop Appium Server
+        if: always()
+        continue-on-error: true
+        run: |
+          echo "Stopping Appium server..."
+          pkill -f appium || echo "Appium server was not running"
+
+      - name: Stop Genymotion Instance
+        if: always()
+        continue-on-error: true
+        run: |
+          echo "Stopping Genymotion instance..."
+          gmsaas instances stop --no-wait "${{ steps.start_instance.outputs.instance_uuid }}"
+          gmsaas instances list
+
+      - name: Upload Screenshots on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Screenshots-on-Failure
+          path: |
+            visuals/actual/
+            visuals/diff/
+          retention-days: 7
+
+      - name: Check Test Results
+        if: always()
+        run: |
+          STANDARD_STATUS=${{ steps.run_standard_tests.outputs.standard_status }}
+          
+          echo "📊 Test Results Summary:"
+          echo "Onboarding Tests: $([ "$ONBOARDING_STATUS" = "0" ] && echo "✅ PASSED" || echo "❌ FAILED")"
+          echo "Standard Tests: $([ "$STANDARD_STATUS" = "0" ] && echo "✅ PASSED" || echo "❌ FAILED")"
+          
+          if [ "$ONBOARDING_STATUS" != "0" ] || [ "$STANDARD_STATUS" != "0" ]; then
+            echo "❌ Some tests failed. Check the artifacts for detailed reports."
+            echo "ℹ️ Workflow completed successfully despite test failures."
+          else
+            echo "✅ All tests passed successfully!"
+          fi
