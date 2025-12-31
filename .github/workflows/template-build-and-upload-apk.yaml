@@ -73,11 +73,11 @@ jobs:
         echo "BUILD_TYPE_CAP=$BUILD_TYPE_CAP" >> $GITHUB_ENV
         echo "BUILD_TYPE_CAP: $BUILD_TYPE_CAP"            
 
-    - name: Set up JDK 21
+    - name: Set up JDK 17
       uses: actions/setup-java@v4
       with:
         distribution: temurin
-        java-version: 21
+        java-version: 17
 
     - name: Install required Android SDK + NDK
       run: |
