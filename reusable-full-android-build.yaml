@@ -1,0 +1,493 @@
+#      ####################################### FINALIZED ###############################################
+
+
+# .github/workflows/android-build-template.yml
+name: "Reusable Android Build Workflow"
+
+on:
+  workflow_call:
+    inputs:
+      build_type:
+        required: false
+        type: string
+        default: debug
+      email_recipients:
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    name: Generate APK and Trigger QA Pipeline
+    steps:
+    - name: Checkout the code
+      uses: actions/checkout@v4
+
+    - name: Set dynamic variables
+      run: |
+        REPO_NAME="${GITHUB_REPOSITORY##*/}"
+        BRANCH_NAME="${GITHUB_REF_NAME}"
+        BUILD_TYPE="${{ inputs.build_type }}"
+
+        # Compute PROJECT_NAME from REPO_NAME (everything after first 2 hyphens)
+        IFS='-' read -ra PARTS <<< "$REPO_NAME"
+        if [ "${#PARTS[@]}" -gt 2 ]; then
+          PROJECT_NAME="${PARTS[@]:3}"
+          PROJECT_NAME="${PROJECT_NAME// /-}"
+        else
+          PROJECT_NAME="$REPO_NAME"
+        fi
+
+        # Compute ENVIRONMENT
+        if [ "$BRANCH_NAME" == "main" ]; then
+          ENVIRONMENT="production"
+        elif [ "$BRANCH_NAME" == "develop" ]; then
+          ENVIRONMENT="staging"
+        else
+          ENVIRONMENT="development"
+        fi
+
+        COMMIT_HASH="${GITHUB_SHA}"
+        FILE_NAME="${PROJECT_NAME}-${ENVIRONMENT}-${COMMIT_HASH}.apk"
+        FILE_PATH="${PROJECT_NAME}/${ENVIRONMENT}/"
+
+        echo "REPO_NAME=$REPO_NAME" >> $GITHUB_ENV
+        echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
+        echo "PROJECT_NAME=$PROJECT_NAME" >> $GITHUB_ENV
+        echo "ENVIRONMENT=$ENVIRONMENT" >> $GITHUB_ENV
+        echo "COMMIT_HASH=$COMMIT_HASH" >> $GITHUB_ENV
+        echo "FILE_NAME=$FILE_NAME" >> $GITHUB_ENV
+        echo "FILE_PATH=$FILE_PATH" >> $GITHUB_ENV
+
+        # Echo all variables to the workflow log
+        echo "==== Dynamic Variables ===="
+        echo "REPO_NAME: $REPO_NAME"
+        echo "BRANCH_NAME: $BRANCH_NAME"
+        echo "PROJECT_NAME: $PROJECT_NAME"
+        echo "ENVIRONMENT: $ENVIRONMENT"
+        echo "COMMIT_HASH: $COMMIT_HASH"
+        echo "FILE_NAME: $FILE_NAME"
+        echo "FILE_PATH: $FILE_PATH"
+        echo "==========================="
+
+        # input: debug or release
+        BUILD_TYPE="${{ inputs.build_type }}"
+        # For Gradle task (Debug / Release)
+        BUILD_TYPE_CAP="$(tr '[:lower:]' '[:upper:]' <<< ${BUILD_TYPE:0:1})${BUILD_TYPE:1}"
+        echo "BUILD_TYPE_CAP=$BUILD_TYPE_CAP" >> $GITHUB_ENV
+        echo "BUILD_TYPE_CAP: $BUILD_TYPE_CAP"            
+
+    # - name: Set up JDK 17
+    #   uses: actions/setup-java@v4
+    #   with:
+    #     distribution: temurin
+    #     java-version: 17
+
+    # - name: Make gradlew executable
+    #   run: chmod +x ./gradlew
+
+    # - name: Build APK
+    #   run: ./gradlew assemble${{env.BUILD_TYPE_CAP}} --stacktrace
+
+    # - name: Rename APK for upload
+    #   run: mv app/build/outputs/apk/${{ inputs.build_type }}/app-${{ inputs.build_type }}.apk ${{ env.FILE_NAME }}
+
+    # - uses: google-github-actions/auth@v3
+    #   with:
+    #     service_account: ${{ secrets.GCP_SA_EMAIL }}
+    #     workload_identity_provider: 'projects/347148155332/locations/global/workloadIdentityPools/github-actions-pool/providers/github'
+
+    # - name: Setup gcloud SDK
+    #   uses: google-github-actions/setup-gcloud@v2
+    #   with:
+    #     project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+    # - name: Upload APK to GCS
+    #   uses: google-github-actions/upload-cloud-storage@v2
+    #   with:
+    #     path: ${{ env.FILE_NAME }}
+    #     destination: gha-bucket-automation/${{ env.FILE_PATH }}
+
+    - name: Set up JDK 21
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: 21
+
+    - name: Install required Android SDK + NDK
+      run: |
+        yes | /usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "ndk;29.0.13599879"
+
+    - name: Make gradlew executable
+      run: chmod +x ./gradlew
+
+    - name: Build APK
+      run: ./gradlew assemble${{env.BUILD_TYPE_CAP}} --stacktrace
+
+    - name: Inspect APK output
+      run: ls app/build/outputs/apk/ -R
+
+    # make finding apk (s) dynamic - standard or multi (flavor) builds
+    - name: Find APK(s)
+      id: find_apk
+      run: |
+        echo "Finding APKs..."
+        for apk in $(find app/build/outputs/apk -name "*-debug.apk"); do
+          echo "Found APK: $apk"
+          # Save each APK path to a temporary file for later use
+          echo "$apk" >> apk_list.txt
+        done
+        # Save the list to GitHub Actions environment
+        echo "APK_LIST_FILE=apk_list.txt" >> $GITHUB_ENV
+
+    # make renaming dynamic - standard or multi (flavor) builds
+    - name: Rename APKs
+      run: |
+        mkdir -p dist
+        while IFS= read -r apk; do
+          # Extract flavor if present
+          FLAVOR=$(basename "$(dirname "$(dirname "$apk")")")
+          
+          # For simple builds, the flavor folder may be 'debug' or 'app', you can normalize it
+          if [ "$FLAVOR" = "${{ inputs.build_type }}" ] || [ "$FLAVOR" = "apk" ]; then  #input type can be debug or release only
+            FLAVOR="standard"
+          fi
+
+          # Construct new name
+          NEW_NAME="${{ env.PROJECT_NAME }}-${{ env.ENVIRONMENT }}-${{ env.COMMIT_HASH }}-${FLAVOR}.apk"
+
+          # Copy to dist folder
+          cp "$apk" "dist/$NEW_NAME"
+          echo "Renamed $apk -> dist/$NEW_NAME"
+        done < ${{ env.APK_LIST_FILE }}
+
+    - name: Debug dist folder
+      run: |
+        echo "Listing dist folder before upload..."
+        ls -lh dist || echo "dist does not exist"
+
+    - uses: google-github-actions/auth@v3
+      with:
+        service_account: ${{ secrets.GCP_SA_EMAIL }}
+        workload_identity_provider: 'projects/347148155332/locations/global/workloadIdentityPools/github-actions-pool/providers/github'
+
+    - name: Setup gcloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+      with:
+        project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+    # upload whole dist folder - standard or multi (flavor) builds
+    - name: Upload APKs to GCS
+      uses: google-github-actions/upload-cloud-storage@v2
+      with:
+        path: dist
+        destination: gha-bucket-automation/${{ env.FILE_PATH }}
+
+    # need to change this to accomodate standard and flavored builds
+    # - name: Generate Signed URL
+    #   id: signed-url
+    #   run: |
+    #     echo '${{ secrets.GCP_SA_KEY }}' > sa.json
+    #     URL=$(gsutil signurl -d 24h sa.json gs://gha-bucket-automation/${{ env.FILE_PATH }}${{ env.FILE_NAME }} | tail -n1 | awk '{print $NF}')
+    #     echo "SIGNED_URL=$URL" >> $GITHUB_ENV
+
+    - name: Generate signed URLs (JSON)
+      id: signed-urls
+      run: |
+        echo '${{ secrets.GCP_SA_KEY }}' > sa.json
+
+        # Start JSON
+        echo "{" > signed_urls.json
+        FIRST=true
+
+        # Loop over files just created in dist/ this run
+        CREATED_FILES=$(ls dist/*.apk 2>/dev/null)
+          
+        for file in $CREATED_FILES; do
+          [ -f "$file" ] || continue
+
+          FILENAME=$(basename "$file")
+
+          URL=$(gsutil signurl -d 24h sa.json \
+            "gs://gha-bucket-automation/${{ env.FILE_PATH }}dist/$FILENAME" \
+            | tail -n1 | awk '{print $NF}')
+
+          # Add comma for valid JSON
+          if [ "$FIRST" = false ]; then
+            echo "," >> signed_urls.json
+          fi
+          FIRST=false
+
+          echo "  \"$FILENAME\": \"$URL\"" >> signed_urls.json
+          echo "Generated signed URL for $FILENAME"
+        done
+
+        echo "}" >> signed_urls.json
+
+        echo "Signed URLs JSON:"
+        cat signed_urls.json
+
+
+
+    # - name: Prepare Notification Variables
+    #   if: always()
+    #   id: notify
+    #   run: |
+    #     STATUS="${{ job.status }}"
+    #     if [ "$STATUS" == "success" ]; then
+    #       EMOJI="✅"
+    #       TITLE="New Build Available!"
+    #       echo "emoji=$EMOJI" >> $GITHUB_OUTPUT
+    #       echo "title=$TITLE" >> $GITHUB_OUTPUT
+    #     else
+    #       EMOJI="❌"
+    #       TITLE="Workflow/Build Failed!"
+    #       echo "emoji=$EMOJI" >> $GITHUB_OUTPUT
+    #       echo "title=$TITLE" >> $GITHUB_OUTPUT
+    #     fi
+
+
+    - name: Prepare Notification Variables
+      if: always()
+      id: notify
+      run: |
+        STATUS="${{ job.status }}"
+        if [ "$STATUS" == "success" ]; then
+          EMOJI="✅"
+          TITLE="New Build Available!"
+          echo "emoji=$EMOJI" >> $GITHUB_OUTPUT
+          echo "title=$TITLE" >> $GITHUB_OUTPUT
+        else
+          EMOJI="❌"
+          TITLE="Workflow/Build Failed!"
+          echo "emoji=$EMOJI" >> $GITHUB_OUTPUT
+          echo "title=$TITLE" >> $GITHUB_OUTPUT
+        fi
+        LINKS=""
+        for file in $(jq -r 'keys[]' signed_urls.json); do
+          URL=$(jq -r --arg key "$file" '.[$key]' signed_urls.json)
+          LINKS="$LINKS• $file: $URL"
+        done
+        # Save for later steps
+        echo "APK_LINKS=$LINKS" >> $GITHUB_ENV
+
+
+
+    # - name: Send Email with APK Link
+    #   if: always()
+    #   uses: dawidd6/action-send-mail@v3
+    #   with:
+    #     server_address: smtp.gmail.com
+    #     server_port: 465
+    #     username: ${{ secrets.EMAIL_USERNAME }}
+    #     password: ${{ secrets.EMAIL_PASSWORD }}
+    #     subject: "${{ steps.notify.outputs.emoji }} ${{ steps.notify.outputs.title }} - ${{ env.PROJECT_NAME }} (${{ env.ENVIRONMENT }})"
+    #     to: ${{ inputs.email_recipients }}
+    #     from: DevOps Bot <noreply@example.com>
+    #     body: |
+    #       Hi Team,
+    #       A new build of **${{ env.PROJECT_NAME }}** is ready!
+
+    #       **Project:** ${{ env.PROJECT_NAME }}
+    #       **Repo:** ${{ env.REPO_NAME }}
+    #       **Branch:** ${{ github.ref_name }}
+    #       **Environment:** ${{ env.ENVIRONMENT }}
+    #       **Commit:** ${{ github.sha }}
+          
+
+    #       Download APK here:
+    #       ${{ env.SIGNED_URL }}
+    #       This link will expire in 24 hours.
+
+
+
+
+
+    - name: Send Email with APK Link
+      if: always()
+      uses: dawidd6/action-send-mail@v3
+      with:
+        server_address: smtp.gmail.com
+        server_port: 465
+        username: ${{ secrets.EMAIL_USERNAME }}
+        password: ${{ secrets.EMAIL_PASSWORD }}
+        subject: "${{ steps.notify.outputs.emoji }} ${{ steps.notify.outputs.title }} - ${{ env.PROJECT_NAME }} (${{ env.ENVIRONMENT }})"
+        to: ${{ inputs.email_recipients }}
+        from: DevOps Bot <noreply@example.com>
+        body: |
+          Hi Team,
+          A new build of **${{ env.PROJECT_NAME }}** is ready!
+
+          **Project:** ${{ env.PROJECT_NAME }}
+          **Repo:** ${{ env.REPO_NAME }}
+          **Branch:** ${{ github.ref_name }}
+          **Environment:** ${{ env.ENVIRONMENT }}
+          **Commit:** ${{ github.sha }}
+          
+
+          Download APK here:
+          ${{ env.APK_LINKS }}
+          This link will expire in 24 hours.
+
+
+
+
+    # Need to fix (hyperlink of signed url) below code, then uncomment and use it and remove long SIGNED URL emil.
+    # - name: Send Email with APK Link
+    #   if: always()
+    #   uses: dawidd6/action-send-mail@v3
+    #   with:
+    #     server_address: smtp.gmail.com
+    #     server_port: 465
+    #     username: ${{ secrets.EMAIL_USERNAME }}
+    #     password: ${{ secrets.EMAIL_PASSWORD }}
+    #     subject: "${{ steps.notify.outputs.emoji }} ${{ steps.notify.outputs.title }} - ${{ env.PROJECT_NAME }} (${{ env.ENVIRONMENT }})"
+    #     to: ${{ inputs.email_recipients }}
+    #     from: DevOps Bot <${{ secrets.EMAIL_USERNAME }}>
+    #     content_type: text/html
+    #     convert_markdown: true
+    #     body: |
+    #       <p>Hi QA Team,</p>
+    #       <p><b>${{ steps.notify.outputs.emoji }}  ${{ steps.notify.outputs.title }}</b></p>
+    #       <ul>
+    #         <li><b>Project:</b> ${{ env.PROJECT_NAME }}</li>
+    #         <li><b>Repo:</b> ${{ env.REPO_NAME }}</li>
+    #         <li><b>Branch:</b> ${{ env.BRANCH_NAME }}</li>
+    #         <li><b>Environment:</b> ${{ env.ENVIRONMENT }}</li>
+    #         <li><b>Commit:</b> ${{ github.sha }}</li>
+    #       </ul>
+    #       <p><a href="${{ env.SIGNED_URL }}">Click here to download the APK</a></p>
+    #       <p><i>This link expires in 24 hours.</i></p>
+ 
+
+
+
+
+
+
+
+    # - name: Send to Google Chat
+    #   if: always()
+    #   run: |
+    #     MESSAGE="${{ steps.notify.outputs.emoji }} *${{ steps.notify.outputs.title }}*
+    #     • Project: \`${{ env.PROJECT_NAME }}\`
+    #     • Repo: \`${{ env.REPO_NAME }}\`
+    #     • Branch: \`${{ env.BRANCH_NAME }}\`
+    #     • Environment: \`${{ env.ENVIRONMENT }}\`
+    #     • Commit: \`${{ github.sha }}\`
+    #     • Download: <${{ env.SIGNED_URL }}|Click here to download>"
+
+    #     PAYLOAD=$(jq -n --arg text "$MESSAGE" '{text: $text}')
+    #     curl -X POST "${{ secrets.GOOGLE_CHAT_WEBHOOK }}" \
+    #       -H "Content-Type: application/json" \
+    #       -d "$PAYLOAD"
+
+
+
+    - name: Send to Google Chat
+      if: always()
+      run: |
+        MESSAGE="${{ steps.notify.outputs.emoji }} *${{ steps.notify.outputs.title }}*
+        • Project: \`${{ env.PROJECT_NAME }}\`
+        • Repo: \`${{ env.REPO_NAME }}\`
+        • Branch: \`${{ env.BRANCH_NAME }}\`
+        • Environment: \`${{ env.ENVIRONMENT }}\`
+        • Commit: \`${{ github.sha }}\`
+        • Download: <${{ env.APK_LINKS }} |Click here to download>"
+
+        PAYLOAD=$(jq -n --arg text "$MESSAGE" '{text: $text}')
+        curl -X POST "${{ secrets.GOOGLE_CHAT_WEBHOOK }}" \
+          -H "Content-Type: application/json" \
+          -d "$PAYLOAD"
+
+
+
+
+
+
+    ################# QA REPO STEPS #################
+    # Compute QA Repo Name: <repo name>-qa-automation
+    - name: Compute QA repo name
+      run: |
+        echo "QA_REPO=${GITHUB_REPOSITORY}-qa-automation" >> $GITHUB_ENV
+
+    - name: Generate GitHub App token
+      id: gh-app-token
+      uses: tibdex/github-app-token@v2
+      with:
+        app_id: ${{ secrets.APP_ID }}
+        private_key: ${{ secrets.APP_PRIVATE_KEY }}
+        installation_id: ${{ secrets.INSTALLATION_ID }}
+
+    # Install GH CLI for testing QA Repo existance
+    - name: Install GitHub CLI
+      run: |
+        sudo apt update && sudo apt install gh -y
+
+    # Add a check on GH if <repo name>-qa-automation exists
+    - name: Verify QA repo exists
+      run: |
+        gh repo view "$QA_REPO" >/dev/null || {
+          echo "QA repo not found: $QA_REPO"
+          exit 1
+        }
+      env:
+        GH_TOKEN: ${{ steps.gh-app-token.outputs.token }}
+
+    # # Used for directly triggering QA repo workflow with APK links JSON - QA pipeline only accepts 1 url, not json
+    # - name: Trigger QA Repo
+    #   uses: peter-evans/repository-dispatch@v3
+    #   with:
+    #     token: ${{ steps.gh-app-token.outputs.token }}
+    #     repository: ${{ env.QA_REPO }}
+    #     event-type: apk-build-reusable
+    #     client-payload: |
+    #       {
+    #         "repo": "${{ github.repository }}",
+    #         "branch": "${{ github.ref_name }}",
+    #         "url": "${{ env.APK_LINKS }}",
+    #         "commit": "${{ github.sha }}"
+    #       }
+
+    # Triggers QA Repo, sending apk links in a loop - standard or multi (flavor)
+    - name: Trigger QA per APK
+      run: |
+        for apk in $(jq -r 'keys[]' signed_urls.json); do
+          url=$(jq -r --arg key "$apk" '.[$key]' signed_urls.json)
+
+          # Build JSON payload safely
+          payload=$(jq -c -n \
+            --arg event "apk-build-reusable" \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg branch "$GITHUB_REF_NAME" \
+            --arg url "$url" \
+            --arg commit "$GITHUB_SHA" \
+            '{
+              event_type: $event,
+              client_payload: {
+                repo: $repo,
+                branch: $branch,
+                url: $url,
+                commit: $commit
+              }
+            }')
+
+          echo "Triggering QA for $apk"
+
+          # Trigger the QA repo workflow
+          curl -s -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${QA_REPO}/dispatches \
+            -d "$payload"
+        done
+      env:
+        GH_TOKEN: ${{ steps.gh-app-token.outputs.token }}
